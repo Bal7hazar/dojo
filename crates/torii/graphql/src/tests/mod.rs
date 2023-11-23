@@ -22,6 +22,7 @@ use starknet::core::types::{BlockId, BlockTag, FieldElement, InvokeTransactionRe
 use starknet::macros::selector;
 use starknet::providers::jsonrpc::HttpTransport;
 use starknet::providers::JsonRpcClient;
+use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use torii_core::engine::{Engine, EngineConfig, Processors};
 use torii_core::processors::register_model::RegisterModelProcessor;
@@ -39,6 +40,7 @@ use crate::schema::build_schema;
 pub struct Connection<T> {
     pub total_count: i64,
     pub edges: Vec<Edge<T>>,
+    pub page_info: PageInfo,
 }
 
 #[derive(Deserialize, Debug, PartialEq)]
@@ -52,6 +54,16 @@ pub struct Entity {
     pub model_names: String,
     pub keys: Option<Vec<String>>,
     pub created_at: Option<String>,
+}
+
+#[derive(Deserialize, Debug, PartialEq)]
+// same as type from `async-graphql` but derive necessary traits
+// https://docs.rs/async-graphql/6.0.10/async_graphql/types/connection/struct.PageInfo.html
+pub struct PageInfo {
+    pub has_previous_page: bool,
+    pub has_next_page: bool,
+    pub start_cursor: Option<String>,
+    pub end_cursor: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -78,6 +90,7 @@ pub struct Position {
 #[derive(Deserialize, Debug, PartialEq)]
 pub struct Record {
     pub __typename: String,
+    pub depth: String,
     pub record_id: u32,
     pub type_u8: u8,
     pub type_u16: u16,
@@ -98,7 +111,7 @@ pub struct Record {
 #[derive(Deserialize, Debug, PartialEq)]
 pub struct Nested {
     pub __typename: String,
-    pub depth: u8,
+    pub depth: String,
     pub type_number: u8,
     pub type_string: String,
     pub type_nested_more: NestedMore,
@@ -107,7 +120,7 @@ pub struct Nested {
 #[derive(Deserialize, Debug, PartialEq)]
 pub struct NestedMore {
     pub __typename: String,
-    pub depth: u8,
+    pub depth: String,
     pub type_number: u8,
     pub type_string: String,
     pub type_nested_more_more: NestedMoreMore,
@@ -116,7 +129,7 @@ pub struct NestedMore {
 #[derive(Deserialize, Debug, PartialEq)]
 pub struct NestedMoreMore {
     pub __typename: String,
-    pub depth: u8,
+    pub depth: String,
     pub type_number: u8,
     pub type_string: String,
 }
@@ -144,7 +157,7 @@ pub struct Content {
     pub website: Option<String>,
     pub icon_uri: Option<String>,
     pub cover_uri: Option<String>,
-    pub socials: Option<Vec<Social>>,
+    pub socials: Vec<Social>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -276,7 +289,7 @@ pub async fn spinup_types_test() -> Result<SqlitePool> {
     execute_strategy(&ws, &migration, &account, None).await.unwrap();
 
     //  Execute `create` and insert 10 records into storage
-    let records_contract = "0x2753d30656b393ecea156189bf0acf5e1063f3ac978fb5c3cebe7a4570bbc78";
+    let records_contract = "0x27f701de7d71a2a6ee670bc1ff47a901fdc671cca26fe234ca1a42273aa7f7d";
     let InvokeTransactionResult { transaction_hash } = account
         .execute(vec![Call {
             calldata: vec![FieldElement::from_str("0xa").unwrap()],
@@ -289,6 +302,7 @@ pub async fn spinup_types_test() -> Result<SqlitePool> {
 
     TransactionWaiter::new(transaction_hash, &provider).await?;
 
+    let (shutdown_tx, _) = broadcast::channel(1);
     let mut engine = Engine::new(
         world,
         &mut db,
@@ -298,6 +312,7 @@ pub async fn spinup_types_test() -> Result<SqlitePool> {
             ..Processors::default()
         },
         EngineConfig::default(),
+        shutdown_tx,
         None,
     );
 

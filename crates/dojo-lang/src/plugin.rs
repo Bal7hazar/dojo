@@ -1,6 +1,3 @@
-use std::fs;
-use std::fs::File;
-use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -14,17 +11,16 @@ use cairo_lang_syntax::attribute::structured::{
 };
 use cairo_lang_syntax::node::db::SyntaxGroup;
 use cairo_lang_syntax::node::helpers::QueryAttrs;
-use cairo_lang_syntax::node::{ast, Terminal};
-use camino::{Utf8Path, Utf8PathBuf};
-use directories::ProjectDirs;
+use cairo_lang_syntax::node::ids::SyntaxStablePtrId;
+use cairo_lang_syntax::node::{ast, Terminal, TypedSyntaxNode};
 use dojo_types::system::Dependency;
 use dojo_world::manifest::Member;
-use lazy_static::lazy_static;
 use scarb::compiler::plugin::builtin::BuiltinStarkNetPlugin;
 use scarb::compiler::plugin::{CairoPlugin, CairoPluginInstance};
-use scarb::core::{DependencyVersionReq, ManifestDependency, PackageId, PackageName, SourceId};
+use scarb::core::{PackageId, PackageName, SourceId};
 use semver::Version;
 use smol_str::SmolStr;
+use url::Url;
 
 use crate::contract::DojoContract;
 use crate::inline_macros::emit::EmitMacro;
@@ -56,7 +52,26 @@ pub struct DojoAuxData {
     /// A list of systems that were processed by the plugin and their model dependencies.
     pub systems: Vec<SystemAuxData>,
 }
+
 impl GeneratedFileAuxData for DojoAuxData {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn eq(&self, other: &dyn GeneratedFileAuxData) -> bool {
+        if let Some(other) = other.as_any().downcast_ref::<Self>() { self == other } else { false }
+    }
+}
+
+/// Dojo related auxiliary data of the Dojo plugin.
+#[derive(Debug, Default, PartialEq)]
+pub struct ComputedValuesAuxData {
+    // Name of entrypoint to get computed value
+    pub entrypoint: SmolStr,
+    // Model to bind to
+    pub model: Option<String>,
+}
+
+impl GeneratedFileAuxData for ComputedValuesAuxData {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -74,27 +89,6 @@ pub const PACKAGE_NAME: &str = "dojo_plugin";
 #[derive(Debug, Default)]
 pub struct BuiltinDojoPlugin;
 
-lazy_static! {
-    static ref MANIFEST_VERSION: Version = Version::parse(env!("CARGO_PKG_VERSION")).expect("Manifest version not defined");
-    static ref MANIFEST_PATH: Utf8PathBuf = {
-        let pd = ProjectDirs::from("com", "dojoengine", "sozo")
-            .expect("no valid home directory path could be retrieved from the operating system");
-
-        let content = include_str!("../Scarb.toml");
-        let path = pd.cache_dir().join(MANIFEST_VERSION.to_string()).join("Scarb.toml");
-
-        // Create the directory if it doesn't exist
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("Failed to create directory");
-        }
-
-        let mut file = File::create(&path).expect("unable to create file");
-        write!(file, "{}", content).expect("unable to write to file");
-
-        Utf8Path::from_path(&path).expect("invalid UTF-8 path").to_path_buf()
-    };
-}
-
 impl BuiltinDojoPlugin {
     fn handle_mod(&self, db: &dyn SyntaxGroup, module_ast: ast::ItemModule) -> PluginResult {
         if module_ast.has_attr(db, DOJO_CONTRACT_ATTR) {
@@ -104,23 +98,106 @@ impl BuiltinDojoPlugin {
         PluginResult::default()
     }
 
-    pub fn manifest_dependency() -> ManifestDependency {
-        let version_req = DependencyVersionReq::exact(&MANIFEST_VERSION);
-        ManifestDependency::builder()
-            .name(PackageName::new(PACKAGE_NAME))
-            .source_id(SourceId::for_path(MANIFEST_PATH.as_path()).unwrap())
-            .version_req(version_req)
-            .build()
+    fn result_with_diagnostic(
+        &self,
+        stable_ptr: SyntaxStablePtrId,
+        message: String,
+    ) -> PluginResult {
+        PluginResult {
+            code: None,
+            diagnostics: vec![PluginDiagnostic { stable_ptr, message }],
+            remove_original_item: false,
+        }
+    }
+
+    fn handle_fn(&self, db: &dyn SyntaxGroup, fn_ast: ast::FunctionWithBody) -> PluginResult {
+        let attrs = fn_ast.attributes(db).query_attr(db, "computed");
+        if attrs.is_empty() {
+            return PluginResult::default();
+        }
+        if attrs.len() != 1 {
+            return self.result_with_diagnostic(
+                attrs[0].attr(db).stable_ptr().untyped(),
+                format!("Expected one computed macro per function, got {:?}.", attrs.len()),
+            );
+        }
+        let attr = attrs[0].clone().structurize(db);
+        let args = attr.args;
+        if args.len() > 1 {
+            return self.result_with_diagnostic(
+                attr.args_stable_ptr.untyped(),
+                "Expected one arg for computed macro.\nUsage: #[computed(Position)]".into(),
+            );
+        }
+        let fn_decl = fn_ast.declaration(db);
+        let fn_name = fn_decl.name(db).text(db);
+        let params = fn_decl.signature(db).parameters(db);
+        let param_els = params.elements(db);
+        let mut model = None;
+        if args.len() == 1 {
+            let model_name = args[0].text(db);
+            model = Some(model_name.clone());
+            let model_type_node = param_els[1].type_clause(db).ty(db);
+            if let ast::Expr::Path(model_type_path) = model_type_node {
+                let model_type = model_type_path
+                    .elements(db)
+                    .iter()
+                    .last()
+                    .unwrap()
+                    .as_syntax_node()
+                    .get_text(db);
+                if model_type != model_name {
+                    return self.result_with_diagnostic(
+                        model_type_path.stable_ptr().untyped(),
+                        "Computed functions second parameter should be the model.".into(),
+                    );
+                }
+            } else {
+                return self.result_with_diagnostic(
+                    params.stable_ptr().untyped(),
+                    format!(
+                        "Computed function parameter node of unsupported type {:?}.",
+                        model_type_node.as_syntax_node().get_text(db)
+                    ),
+                );
+            }
+            if param_els.len() != 2 {
+                return self.result_with_diagnostic(
+                    params.stable_ptr().untyped(),
+                    "Computed function should take 2 parameters, contract state and model.".into(),
+                );
+            }
+        }
+
+        PluginResult {
+            code: Some(PluginGeneratedFile {
+                name: fn_name.clone(),
+                content: "".into(),
+                aux_data: Some(DynGeneratedFileAuxData::new(ComputedValuesAuxData {
+                    model,
+                    entrypoint: fn_name,
+                })),
+                diagnostics_mappings: vec![],
+            }),
+            diagnostics: vec![],
+            remove_original_item: false,
+        }
     }
 }
 
 impl CairoPlugin for BuiltinDojoPlugin {
     fn id(&self) -> PackageId {
-        PackageId::new(
-            PackageName::new(PACKAGE_NAME),
-            MANIFEST_VERSION.to_owned(),
-            SourceId::for_path(MANIFEST_PATH.as_path()).unwrap(),
-        )
+        let url = Url::parse("https://github.com/dojoengine/dojo").unwrap();
+        let version = env!("CARGO_PKG_VERSION");
+        let rev = env!("GIT_HASH");
+
+        let source_id =
+            SourceId::for_git(&url, &scarb::core::GitReference::Tag(format!("v{version}").into()))
+                .unwrap()
+                .with_precise(rev.to_string())
+                .unwrap();
+
+        PackageId::new(PackageName::new(PACKAGE_NAME), Version::parse(version).unwrap(), source_id)
     }
 
     fn instantiate(&self) -> Result<Box<dyn CairoPluginInstance>> {
@@ -305,12 +382,13 @@ impl MacroPlugin for BuiltinDojoPlugin {
                     remove_original_item: false,
                 }
             }
+            ast::Item::FreeFunction(fn_ast) => self.handle_fn(db, fn_ast),
             _ => PluginResult::default(),
         }
     }
 
     fn declared_attributes(&self) -> Vec<String> {
-        vec!["dojo::contract".to_string(), "key".to_string()]
+        vec!["dojo::contract".to_string(), "key".to_string(), "computed".to_string()]
     }
 }
 

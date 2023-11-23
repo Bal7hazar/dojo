@@ -89,11 +89,11 @@ jobs:
           # The target is used by Cargo
           # The arch is either 386, arm64 or amd64
           # The svm target platform to use for the binary https://github.com/roynalnaruto/svm-rs/blob/84cbe0ac705becabdc13168bae28a45ad2299749/svm-builds/build.rs#L4-L24
-          - os: ubuntu-latest-32-cores
+          - os: ubuntu-latest-4-cores
             platform: linux
             target: x86_64-unknown-linux-gnu
             arch: amd64
-          - os: ubuntu-latest-32-cores
+          - os: ubuntu-latest-4-cores
             platform: linux
             target: aarch64-unknown-linux-gnu
             arch: arm64
@@ -191,6 +191,20 @@ jobs:
           body: ${{ needs.prepare.outputs.changelog }}
           files: |
             ${{ steps.artifacts.outputs.file_name }}
+      
+      # Upload these for use with the Docker build later
+      - name: Upload binaries
+        uses: actions/upload-artifact@v2
+        with:
+          name: binaries
+          path: |
+            target/x86_64-unknown-linux-gnu/release/katana
+            target/x86_64-unknown-linux-gnu/release/sozo
+            target/x86_64-unknown-linux-gnu/release/torii
+            target/aarch64-unknown-linux-gnu/release/katana
+            target/aarch64-unknown-linux-gnu/release/sozo
+            target/aarch64-unknown-linux-gnu/release/torii
+          retention-days: 1
 
   cleanup:
     name: Release cleanup
@@ -217,14 +231,20 @@ jobs:
             const prunePrereleases = require('./.github/scripts/prune-prereleases.js')
             await prunePrereleases({github, context})
 
-  docker-build-and-push:
-    name: Build and push Docker image
-    runs-on: ubuntu-latest-32-cores
-    needs: prepare
+  docker-build-and-push-linux-arm64:
+    name: Build and push linux-arm64 docker image
+    runs-on: ubuntu-latest-4-cores
+    needs: [prepare, release]
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v2
+
+      - name: Download binaries
+        uses: actions/download-artifact@v2
+        with:
+          name: binaries
+          path: target/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
@@ -236,9 +256,47 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Build and push docker image
         uses: docker/build-push-action@v4
         with:
           push: true
           tags: ghcr.io/${{ github.repository }}:latest,ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.tag_name }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/arm64
+          target: arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  docker-build-and-push-linux-amd64:
+    name: Build and push linux-amd64 docker image
+    runs-on: ubuntu-latest-4-cores
+    needs: [prepare, release]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Download binaries
+        uses: actions/download-artifact@v2
+        with:
+          name: binaries
+          path: target/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push docker image
+        uses: docker/build-push-action@v4
+        with:
+          push: true
+          tags: ghcr.io/${{ github.repository }}:latest,ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.tag_name }}
+          platforms: linux/amd64
+          target: amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
