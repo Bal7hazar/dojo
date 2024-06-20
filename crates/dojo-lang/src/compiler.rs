@@ -99,13 +99,16 @@ impl Compiler for DojoCompiler {
         };
 
         // (contract name, class hash)
-        let mut compiled_classes: HashMap<SmolStr, (FieldElement, Option<abi::Contract>)> =
-            HashMap::new();
+        let mut compiled_classes: HashMap<
+            SmolStr,
+            (FieldElement, Option<abi::Contract>),
+        > = HashMap::new();
 
         for (decl, class) in zip(contracts, classes) {
             let target_name = &unit.target().name;
             let contract_name = decl.submodule_id.name(db.upcast_mut());
             let file_name = format!("{target_name}-{contract_name}.json");
+            let abi_file_name = format!("{target_name}-{contract_name}_abi.json");
 
             let mut file = target_dir.open_rw(file_name.clone(), "output file", ws.config())?;
             serde_json::to_writer_pretty(file.deref_mut(), &class)
@@ -114,6 +117,12 @@ impl Compiler for DojoCompiler {
             let class_hash = compute_class_hash_of_contract_class(&class).with_context(|| {
                 format!("problem computing class hash for contract `{contract_name}`")
             })?;
+
+            // Write abi file
+            let mut abi_file = target_dir.open_rw(&abi_file_name, "output file", ws.config())?;
+            serde_json::to_writer_pretty(abi_file.deref_mut(), &class.abi)
+                .with_context(|| format!("failed to serialize ABI for contract: {}", contract_name))?;
+
             compiled_classes.insert(contract_name, (class_hash, class.abi));
         }
 
@@ -219,7 +228,8 @@ fn update_manifest(
     }
 
     let world = {
-        let (hash, abi) = get_compiled_artifact_from_map(&compiled_artifacts, WORLD_CONTRACT_NAME)?;
+        let (hash, abi) =
+            get_compiled_artifact_from_map(&compiled_artifacts, WORLD_CONTRACT_NAME)?;
         Contract {
             name: WORLD_CONTRACT_NAME.into(),
             abi: abi.clone(),
@@ -240,8 +250,13 @@ fn update_manifest(
     };
 
     let base = {
-        let (hash, abi) = get_compiled_artifact_from_map(&compiled_artifacts, BASE_CONTRACT_NAME)?;
-        Class { name: BASE_CONTRACT_NAME.into(), abi: abi.clone(), class_hash: *hash }
+        let (hash, abi) =
+            get_compiled_artifact_from_map(&compiled_artifacts, BASE_CONTRACT_NAME)?;
+        Class {
+            name: BASE_CONTRACT_NAME.into(),
+            abi: abi.clone(),
+            class_hash: *hash,
+        }
     };
 
     let mut models = BTreeMap::new();
